@@ -20,6 +20,8 @@ import os
 import sys
 import time
 
+sys.stdout.reconfigure(encoding="utf-8")
+
 try:
     import httpx
 except ImportError:
@@ -27,8 +29,8 @@ except ImportError:
     sys.exit(1)
 
 
-BASE = os.environ.get("API_BASE", "http://localhost:8000")
-client = httpx.Client(base_url=BASE, timeout=60)
+BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+client = httpx.Client(base_url=BASE, timeout=300)
 
 
 def header(msg: str) -> None:

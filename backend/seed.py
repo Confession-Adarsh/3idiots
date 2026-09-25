@@ -16,6 +16,8 @@ import os
 import sys
 import uuid
 
+sys.stdout.reconfigure(encoding="utf-8")
+
 # ---------------------------------------------------------------------------
 # Make sure we can import from app/ when run as "python seed.py" from backend/
 # ---------------------------------------------------------------------------

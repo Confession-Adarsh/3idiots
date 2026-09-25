@@ -174,7 +174,7 @@ def _tier2_ollama(system_prompt: str, user_message: str) -> dict:
     )
 
     payload: dict[str, Any] = {
-        "model": "qwen3:4b-thinking",
+        "model": "qwen2.5:0.5b",
         "prompt": prompt,
         "stream": False,
         "raw": True,            # we've already formatted the prompt ourselves
@@ -186,7 +186,7 @@ def _tier2_ollama(system_prompt: str, user_message: str) -> dict:
     }
 
     resp = httpx.post(
-        "http://localhost:11434/api/generate",
+        "http://127.0.0.1:11434/api/generate",
         json=payload,
         timeout=15.0,
     )
@@ -222,6 +222,7 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "act as",
     "always reveal",
     "new instruction",
+    "bhool jao",
 )
 
 # Stop-words excluded from keyword overlap scoring
