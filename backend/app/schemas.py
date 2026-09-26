@@ -30,6 +30,7 @@ class SearchResultItem(BaseModel):
     tags: list[str]
     location: Optional[str]
     description: Optional[str]
+    url: Optional[str] = None
     retrieval_score: float = Field(description="pgvector cosine score or 0.0 for keyword fallback")
     reason: str = Field(description="Why the LLM router judged this entity relevant")
 

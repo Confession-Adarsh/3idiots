@@ -128,33 +128,12 @@ def _tier1_groq(system_prompt: str, user_message: str) -> dict:
 
 
 # ===========================================================================
-# Tier 2 — Ollama  (qwen3:4b-thinking, GBNF grammar, 15 s timeout)
+# Tier 2 — Ollama  (qwen3:4b-thinking, /api/chat, 20 s timeout)
 # ===========================================================================
 
-# GBNF grammar that constrains Ollama's output to EXACTLY our JSON shape.
-# Matches: {"matches":[{"id":"...","reason":"..."},...],
-#            "injection_detected":false,"confidence":0.85}
-_GBNF_GRAMMAR = r"""
-root   ::= "{" ws q-matches ws ":" ws arr ws ","
-               ws q-injection ws ":" ws bool ws ","
-               ws q-confidence ws ":" ws num ws "}"
-arr    ::= "[]"
-         | "[" ws item (ws "," ws item)* ws "]"
-item   ::= "{" ws q-id ws ":" ws str ws "," ws q-reason ws ":" ws str ws "}"
-bool   ::= "true" | "false"
-str    ::= "\"" char* "\""
-char   ::= [^"\\] | "\\" (["\\/bfnrt] | "u" hex hex hex hex)
-hex    ::= [0-9a-fA-F]
-num    ::= ("0" | [1-9] [0-9]*) ("." [0-9]+)?
-ws     ::= [ \t\n\r]*
-q-matches    ::= "\"matches\""
-q-injection  ::= "\"injection_detected\""
-q-confidence ::= "\"confidence\""
-q-id         ::= "\"id\""
-q-reason     ::= "\"reason\""
-"""
-
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+_JSON_RE = re.compile(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL)
 
 
 def _strip_think(text: str) -> str:
@@ -162,39 +141,63 @@ def _strip_think(text: str) -> str:
     return _THINK_RE.sub("", text).strip()
 
 
+def _extract_json(text: str) -> dict:
+    """Best-effort JSON extraction from potentially messy LLM output."""
+    text = _strip_think(text)
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try to find a JSON object in the text
+    for m in _JSON_RE.finditer(text):
+        try:
+            return json.loads(m.group())
+        except (json.JSONDecodeError, ValueError):
+            continue
+    raise ValueError(f"No valid JSON found in: {text[:200]}")
+
+
 def _tier2_ollama(system_prompt: str, user_message: str) -> dict:
     import httpx  # lazy import
 
-    # Use the /api/generate endpoint so we can pass the raw GBNF grammar.
-    # We manually build the prompt in ChatML format that qwen3 understands.
-    prompt = (
-        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        f"<|im_start|>user\n{user_message}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-
+    # Use /api/chat — this properly handles qwen3's separate thinking field.
+    # The GBNF grammar is NOT supported on the chat endpoint and was causing
+    # empty responses on /api/generate, so we rely on the system prompt
+    # to enforce JSON output instead.
     payload: dict[str, Any] = {
-        "model": "qwen2.5:0.5b",
-        "prompt": prompt,
+        "model": "qwen3:4b-thinking",
+        "messages": [
+            {"role": "system", "content": system_prompt + "\n\nYou MUST respond with ONLY valid JSON, no markdown fences, no extra text."},
+            {"role": "user",   "content": user_message},
+        ],
         "stream": False,
-        "raw": True,            # we've already formatted the prompt ourselves
         "options": {
-            "grammar": _GBNF_GRAMMAR,
             "temperature": 0.1,
-            "num_predict": 512,
+            "num_predict": 1024,   # enough for thinking + actual JSON response
         },
     }
 
     resp = httpx.post(
-        "http://127.0.0.1:11434/api/generate",
+        "http://127.0.0.1:11434/api/chat",
         json=payload,
-        timeout=15.0,
+        timeout=8.0,
     )
     resp.raise_for_status()
 
-    raw_text = resp.json()["response"]
-    raw_text = _strip_think(raw_text)
-    return _validate(json.loads(raw_text))
+    data = resp.json()
+    raw_text = data.get("message", {}).get("content", "")
+
+    # If content is empty but thinking exists, the model used all tokens
+    # on reasoning — treat as a failure so we fall through to Tier 3.
+    if not raw_text.strip():
+        thinking = data.get("message", {}).get("thinking", "")
+        raise ValueError(
+            f"Ollama returned empty content (thinking used all tokens). "
+            f"Thinking preview: {thinking[:100]}"
+        )
+
+    return _validate(_extract_json(raw_text))
 
 
 # ===========================================================================
@@ -223,13 +226,46 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "always reveal",
     "new instruction",
     "bhool jao",
+    "bhul jao",
+    "ignore karo",
+    "bypass karo",
+    "dump karo",
+    "developer mode",
+    "rules ko",
+    "restrictions",
+    "sabhi users",
+    "private information",
+    "phone number",
+    "email address",
+    "contact details",
 )
+
+# Hinglish → English synonyms so "Lucknow mein Flutter events" works
+_HINGLISH_MAP: dict[str, list[str]] = {
+    "mein": ["in"],
+    "aur": ["and"],
+    "ke": ["of", "for"],
+    "ka": ["of", "for"],
+    "ki": ["of", "for"],
+    "hai": [],
+    "kya": ["what"],
+    "kaise": ["how"],
+    "kaha": ["where"],
+    "kahan": ["where"],
+    "sabse": ["most", "best", "top"],
+    "naye": ["new", "latest"],
+    "purane": ["old"],
+    "achhe": ["good", "best"],
+    "bade": ["big", "large"],
+    "log": ["people", "developers"],
+}
 
 # Stop-words excluded from keyword overlap scoring
 _STOP_WORDS: frozenset[str] = frozenset(
     "the a an and or in at for of to is are was were be been being "
     "have has had do does did will would could should may might "
-    "i me my we our you your it its they their that this".split()
+    "i me my we our you your it its they their that this "
+    "mein aur hai ke ka ki kya se".split()
 )
 
 
@@ -238,8 +274,20 @@ def _injection_signal(text: str) -> bool:
     return any(pat in lowered for pat in _INJECTION_PATTERNS)
 
 
+def _expand_hinglish(words: set[str]) -> set[str]:
+    """Expand Hinglish query words with English equivalents."""
+    expanded = set(words)
+    for w in words:
+        if w in _HINGLISH_MAP:
+            expanded.update(_HINGLISH_MAP[w])
+    return expanded
+
+
 def _keyword_score(query_words: set[str], chunk: dict) -> tuple[float, set[str]]:
-    """Return (overlap_ratio, matched_words) between query and a chunk."""
+    """
+    Return (score, matched_words) between query and a chunk.
+    Uses both exact word overlap AND substring matching for compound terms.
+    """
     chunk_blob = " ".join(
         filter(
             None,
@@ -252,11 +300,30 @@ def _keyword_score(query_words: set[str], chunk: dict) -> tuple[float, set[str]]
         )
     ).lower()
     chunk_words = set(re.findall(r"\w+", chunk_blob)) - _STOP_WORDS
-    overlap = (query_words - _STOP_WORDS) & chunk_words
-    if not query_words - _STOP_WORDS:
+
+    meaningful_query = query_words - _STOP_WORDS
+    if not meaningful_query:
         return 0.0, set()
-    ratio = len(overlap) / len(query_words - _STOP_WORDS)
-    return ratio, overlap
+
+    # Exact word overlap
+    overlap = meaningful_query & chunk_words
+
+    # Substring matching: "flutter" matches "flutterfest", "devops" matches
+    # "devsecops", etc.
+    for qw in meaningful_query - overlap:
+        if len(qw) >= 3:  # only for words 3+ chars
+            for cw in chunk_words:
+                if qw in cw or cw in qw:
+                    overlap.add(qw)
+                    break
+
+    if not overlap:
+        return 0.0, set()
+
+    # Score = overlap ratio, boosted for high absolute overlap
+    ratio = len(overlap) / len(meaningful_query)
+    bonus = min(len(overlap) * 0.05, 0.2)
+    return ratio + bonus, overlap
 
 
 def _tier3_rules(query_text: str, kb_chunks: list[dict]) -> dict:
@@ -276,15 +343,17 @@ def _tier3_rules(query_text: str, kb_chunks: list[dict]) -> dict:
         if _injection_signal(blob):
             return {"matches": [], "injection_detected": True, "confidence": 0.9}
 
-    # 3. Keyword relevance scoring
-    query_words = set(re.findall(r"\w+", query_text.lower()))
+    # 3. Expand Hinglish terms and do keyword relevance scoring
+    raw_words = set(re.findall(r"\w+", query_text.lower()))
+    query_words = _expand_hinglish(raw_words)
+
     scored: list[tuple[float, dict]] = []
     for chunk in kb_chunks:
         score, matched = _keyword_score(query_words, chunk)
         if score > 0:
             reason_words = sorted(matched)[:5]
             reason = (
-                f"Keyword match on: {', '.join(reason_words)}."
+                f"Matched: {', '.join(reason_words)}."
                 if reason_words
                 else "Partial term overlap with query."
             )
@@ -301,14 +370,23 @@ def _tier3_rules(query_text: str, kb_chunks: list[dict]) -> dict:
     scored.sort(key=lambda t: t[0], reverse=True)
     matches = [m for _, m in scored]
 
-    # Confidence: rule-based is inherently limited — cap at 0.55
-    confidence = min(0.2 + 0.07 * len(matches), 0.55) if matches else 0.15
+    # Confidence: rule-based can now go higher with good matches
+    if matches:
+        top_score = scored[0][0]
+        confidence = min(0.4 + top_score * 0.45, 0.85)
+    else:
+        confidence = 0.15
 
     return {
         "matches": matches,
         "injection_detected": False,
         "confidence": round(confidence, 2),
     }
+
+
+
+
+
 
 
 # ===========================================================================
